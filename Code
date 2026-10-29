@@ -1,6 +1,10 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
+#////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#Main Parameteres
+#////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
 g = 9.81
 rho0 = 1.225
 H = 8500.0
@@ -12,6 +16,10 @@ A = 0.005
 
 I = 200.0
 t_ramp = 0.05
+
+#////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#Main Functions
+#////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 
 def thrust(t, P):
@@ -69,16 +77,13 @@ def simulate(tb, N=200, dt_coast=0.01):
         "A": A,
         "burning": True
     }
-
-    # The rocket sits on the ground until thrust equals weight:
-    # Tmax*t/t_ramp = (m0 - mp*t/tb)*g
+    
     t_liftoff = m0 * g / (Tmax / t_ramp + mp * g / tb)
     if t_liftoff >= t_ramp:
         raise ValueError("Rocket does not lift off during the ramp: thrust too low.")
 
-    # state at lift-off: h = 0, v = 0, impulse already delivered = area of the thrust triangle
     y = np.array([0.0, 0.0, 0.5 * Tmax * t_liftoff**2 / t_ramp, 0.0])
-    ramp_steps = max(N // 10, 5)          # ramp steps scale with N
+    ramp_steps = max(N // 10, 5)          
 
     for start, end, n_steps in [
         (t_liftoff, t_ramp, ramp_steps),
@@ -239,6 +244,7 @@ plt.grid(alpha=0.3, which="both")
 plt.show()
 
 #////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#Test with Linearlized Model
 #////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 def test_rhs(t, y, P):
@@ -311,4 +317,4 @@ plt.xlabel("Time step")
 plt.ylabel("Error against exact solution")
 plt.grid(True, which="both")
 plt.legend()
-plt.show()    
+plt.show()
