@@ -1,0 +1,314 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+g = 9.81
+rho0 = 1.225
+H = 8500.0
+
+m0 = 1.0
+mp = 0.10
+CD = 0.56
+A = 0.005
+
+I = 200.0
+t_ramp = 0.05
+
+
+def thrust(t, P):
+    if not P["burning"]:
+        return 0.0
+
+    t = min(t, P["tb"])
+    if t < P["tr"]:
+        return P["Tmax"] * t / P["tr"]
+
+    return P["Tmax"]
+
+
+def rhs(t, y, P):
+    h, v, impulse, drag_loss = y
+
+    time_used = min(max(t, 0.0), P["tb"])
+    mass = P["m0"] - P["mp"] * time_used / P["tb"]
+    T = thrust(t, P)
+
+    drag = (
+        0.5 * rho0 * np.exp(-h / H)
+        * P["CD"] * P["A"] * v * abs(v)
+    )
+
+    return np.array([
+        v,
+        (T - drag) / mass - g,
+        T,
+        drag / mass
+    ])
+
+
+def rk4_step(t, y, dt, P, rhs_function=rhs):
+    k1 = rhs_function(t, y, P)
+    k2 = rhs_function(t + dt / 2, y + dt * k1 / 2, P)
+    k3 = rhs_function(t + dt / 2, y + dt * k2 / 2, P)
+    k4 = rhs_function(t + dt, y + dt * k3, P)
+    return y + dt * (k1 + 2*k2 + 2*k3 + k4) / 6
+
+
+def simulate(tb, N=200, dt_coast=0.01):
+    if tb <= t_ramp:
+        raise ValueError("Burn time must be greater than the fixed ramp time.")
+
+    Tmax = I / (tb - t_ramp / 2)
+
+    P = {
+        "tb": tb,
+        "tr": t_ramp,
+        "Tmax": Tmax,
+        "m0": m0,
+        "mp": mp,
+        "CD": CD,
+        "A": A,
+        "burning": True
+    }
+
+    # The rocket sits on the ground until thrust equals weight:
+    # Tmax*t/t_ramp = (m0 - mp*t/tb)*g
+    t_liftoff = m0 * g / (Tmax / t_ramp + mp * g / tb)
+    if t_liftoff >= t_ramp:
+        raise ValueError("Rocket does not lift off during the ramp: thrust too low.")
+
+    # state at lift-off: h = 0, v = 0, impulse already delivered = area of the thrust triangle
+    y = np.array([0.0, 0.0, 0.5 * Tmax * t_liftoff**2 / t_ramp, 0.0])
+    ramp_steps = max(N // 10, 5)          # ramp steps scale with N
+
+    for start, end, n_steps in [
+        (t_liftoff, t_ramp, ramp_steps),
+        (t_ramp, tb, N)
+    ]:
+        dt = (end - start) / n_steps
+
+        for i in range(n_steps):
+            t = start + i * dt
+            y = rk4_step(t, y, dt, P)
+
+    impulse_burn = y[2]
+    P["burning"] = False
+    t = tb
+
+    for _ in range(2_000_000):
+        y_next = rk4_step(t, y, dt_coast, P)
+
+        if y_next[1] <= 0.0:
+            s = y[1] / (y[1] - y_next[1]) * dt_coast
+            acceleration = (y_next[1] - y[1]) / dt_coast
+            apogee = y[0] + y[1] * s + 0.5 * acceleration * s**2
+            return apogee, impulse_burn
+
+        y = y_next
+        t += dt_coast
+
+    raise RuntimeError("Apogee was not reached.")
+
+
+burn_times = np.logspace(np.log10(0.3), np.log10(8.0), 40)
+apogees = []
+
+for tb in burn_times:
+    apogee, impulse_burn = simulate(tb)
+    apogees.append(apogee)
+
+    if abs(impulse_burn - I) / I > 1e-6:
+        raise RuntimeError("Numerical impulse check failed.")
+
+apogees = np.array(apogees)
+best_index = np.argmax(apogees)
+
+print(f"Best sampled burn time: {burn_times[best_index]:.3f} s")
+print(f"Apogee at that burn time: {apogees[best_index]:.3f} m")
+
+plt.figure(figsize=(7, 4))
+plt.plot(burn_times, apogees, label="One rocket")
+plt.plot(
+    burn_times[best_index],
+    apogees[best_index],
+    "ko",
+    label=f"Best sampled time = {burn_times[best_index]:.2f} s"
+)
+plt.xscale("log")
+plt.xlabel("Burn time [s]")
+plt.ylabel("Apogee [m]")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+tb_test = burn_times[best_index]
+refinement_levels = np.array([1, 2, 4, 8, 16])
+N_base = 200
+dt_coast_base = 0.01
+
+N_values = []
+convergence_apogees = []
+
+for level in refinement_levels:
+    N = N_base * level
+    dt_coast = dt_coast_base / level
+    apogee, _ = simulate(tb_test, N=N, dt_coast=dt_coast)
+
+    N_values.append(N)
+    convergence_apogees.append(apogee)
+
+N_values = np.array(N_values)
+convergence_apogees = np.array(convergence_apogees)
+changes = np.abs(np.diff(convergence_apogees))
+
+print(f"\nConvergence study at tb = {tb_test:.3f} s")
+print("N steps       apogee [m]       change from next refinement [m]")
+
+for i, N in enumerate(N_values):
+    if i < len(changes):
+        change_text = f"{changes[i]:.6e}"
+    else:
+        change_text = "—"
+
+    print(
+        f"{N:7d}       {convergence_apogees[i]:12.8f}"
+        f"       {change_text:>20s}"
+    )
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+
+axes[0].plot(N_values, convergence_apogees, "o-")
+axes[0].set_xlabel("Burn-phase RK4 steps, N")
+axes[0].set_ylabel("Apogee [m]")
+axes[0].set_title("Apogee as the time steps are refined")
+axes[0].grid(True)
+
+axes[1].loglog(N_values[:-1], changes, "o-")
+axes[1].set_xlabel("Burn-phase RK4 steps, N")
+axes[1].set_ylabel("Change from next refinement [m]")
+axes[1].set_title("Successive apogee changes")
+axes[1].grid(True, which="both")
+
+plt.tight_layout()
+plt.show()
+
+#////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+tb_test = 5.25
+refine = np.array([1, 2, 4, 8, 16])
+N_base = 200
+dt_coast_base = 0.01
+
+def run_with_refinement(r):
+    apogee, _ = simulate(
+        tb_test,
+        N=N_base * r,
+        dt_coast=dt_coast_base / r
+    )
+    return apogee
+
+h_ref = run_with_refinement(64)
+
+dts = (tb_test - t_ramp) / (N_base * refine)
+heights = np.array([run_with_refinement(r) for r in refine])
+errors = np.abs(heights - h_ref)
+
+print("dt [s]       apogee [m]       error [m]       observed order")
+for i in range(len(refine)):
+    if i == 0 or errors[i] == 0 or errors[i - 1] == 0:
+        order = "—"
+    else:
+        order = f"{np.log2(errors[i - 1] / errors[i]):.2f}"
+
+    print(f"{dts[i]:10.6f}   {heights[i]:14.8f}   {errors[i]:.3e}   {order}")
+
+plt.figure(figsize=(6, 4.5))
+plt.loglog(dts, errors, "o-", label="Apogee error vs. fine reference")
+plt.loglog(
+    dts,
+    errors[0] * (dts / dts[0])**4,
+    "k--",
+    label=r"Fourth-order guide ($\Delta t^4$)"
+)
+plt.xlabel(r"Burn-phase step size $\Delta t$ [s]")
+plt.ylabel("Apogee error [m]")
+plt.legend()
+plt.grid(alpha=0.3, which="both")
+plt.show()
+
+#////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+def test_rhs(t, y, P):
+    h, v = y
+    mass = P["m0"] - P["mdot"] * t
+    return np.array([
+        v,
+        P["ve"] * P["mdot"] / mass - P["g"]
+    ])
+
+
+P_test = {
+    "m0": 1.0,
+    "mdot": 0.02,
+    "ve": 1200.0,
+    "g": 9.81
+}
+
+final_time = 5.0
+steps = [10, 20, 40, 80]
+dt_values = []
+errors = []
+
+mass_final = P_test["m0"] - P_test["mdot"] * final_time
+
+exact_v = (
+    P_test["ve"] * np.log(P_test["m0"] / mass_final)
+    - P_test["g"] * final_time
+)
+
+exact_h = (
+    P_test["ve"] / P_test["mdot"]
+    * (
+        P_test["m0"] - mass_final
+        - mass_final * np.log(P_test["m0"] / mass_final)
+    )
+    - 0.5 * P_test["g"] * final_time**2
+)
+
+for N in steps:
+    dt = final_time / N
+    y = np.array([0.0, 0.0])
+
+    for i in range(N):
+        y = rk4_step(i * dt, y, dt, P_test, rhs_function=test_rhs)
+
+    error = np.sqrt((y[0] - exact_h)**2 + (y[1] - exact_v)**2)
+    dt_values.append(dt)
+    errors.append(error)
+
+dt_values = np.array(dt_values)
+errors = np.array(errors)
+
+print("dt, error, observed order")
+for i in range(len(steps)):
+    if i == 0:
+        print(dt_values[i], errors[i], "-")
+    else:
+        order = np.log2(errors[i - 1] / errors[i])
+        print(dt_values[i], errors[i], order)
+
+plt.loglog(dt_values, errors, "o-", label="RK4 error")
+plt.loglog(
+    dt_values,
+    errors[0] * (dt_values / dt_values[0])**4,
+    "--",
+    label="Fourth-order reference"
+)
+plt.xlabel("Time step")
+plt.ylabel("Error against exact solution")
+plt.grid(True, which="both")
+plt.legend()
+plt.show()    
