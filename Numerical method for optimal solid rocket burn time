@@ -1,0 +1,429 @@
+# AE 370 Group Project: Optimal burn time for a solid rocket Using Runge Kutta 4th Order Numerical Methods (RK4)
+
+**Question:** for a fixed total impulse `I` and propellant mass `m_p`, which burn time `t_b` maximizes apogee, and how does that optimum depend on the rocket's mass and drag?
+
+**Model** (vertical flight, exponential atmosphere, linear mass depletion):
+
+$$\dot h = v,\qquad \dot v = \frac{T(t) - \tfrac12\rho(h)C_D A\,v|v|}{m(t)} - g,\qquad \rho(h)=\rho_0 e^{-h/H}$$
+
+**Notebook map**
+
+| Section | What it does | Report section |
+|---|---|---|
+| 1. Parameters | all constants in one place | Implementation, Table 1 |
+| 2. Model + RK4 solver | `thrust`, `rhs`, `rk4_step`, `simulate` | Methodology |
+| 3. Burn-time sweep | apogee vs `t_b` for each mass, finds `t_b*` | Result |
+| 4. Loss breakdown | drag loss vs gravity loss | (missing from report) |
+| 5. Verification | convergence, exact rocket equation, impulse, stability | Implementation |
+| 6. Optimum vs rocket | `t_b*` against mass / ballistic coefficient | Result |
+
+## 1. Parameters
+import numpy as np
+import matplotlib.pyplot as plt
+from dataclasses import dataclass
+
+# ---- Physical constants ----
+g    = 9.81      # gravitational acceleration [m/s^2]
+rho0 = 1.225     # sea-level air density      [kg/m^3]
+H    = 8500.0    # density scale height       [m]
+
+# ---- Rocket and motor (fixed for every run) ----
+mp     = 0.10    # propellant mass            [kg]
+CD     = 0.56    # drag coefficient           [-]
+A      = 0.005   # frontal area               [m^2]
+I      = 200.0   # total impulse              [N s]
+t_ramp = 0.05    # thrust ramp-up time        [s]
+
+# ---- Wet masses studied ----
+m_values = [0.8, 0.9, 1.0, 1.1, 1.2]   # [kg]
+
+# ---- Numerical settings (justified by the convergence study in Section 5) ----
+N_BURN   = 200     # RK4 steps in the constant-thrust phase [t_ramp, t_b]
+DT_COAST = 0.01    # RK4 step in the coast phase            [s]
+# The ramp phase uses max(N_BURN // 10, 5) steps (= 20 at the baseline).
+
+# ---- Burn-time sweep: 50 log-spaced values from 0.3 s to 10 s ----
+burn_times = np.logspace(np.log10(0.3), np.log10(10.0), 50)
+## 2. Model and RK4 solver
+
+The state vector is `y = [h, v, J, dv_drag, dv_thrust]`. Only `h` and `v` are the physical unknowns. The other three are integrated alongside them as bookkeeping and do not feed back into `h` or `v`:
+
+| index | symbol | meaning |
+|---|---|---|
+| 0 | `h` | altitude [m] |
+| 1 | `v` | velocity [m/s] |
+| 2 | `J = ∫T dt` | delivered impulse [N s] (used to check `J(t_b) = I`) |
+| 3 | `∫ D/m dt` | velocity lost to drag [m/s] |
+| 4 | `∫ T/m dt` | velocity gained from thrust [m/s] |
+
+Thrust ramps linearly to `T_max` over `t_ramp`, holds until burnout `t_b`, then is zero. `T_max = I / (t_b - t_ramp/2)` makes the impulse exactly `I` for every `t_b`. Mass falls linearly from `m0` to `m0 - m_p` over the burn.
+iH, iV, iJ, iDRAG, iTHRUST = range(5)    # indices into the state vector
+
+
+@dataclass
+class Rocket:
+    """Everything the right-hand side needs for one flight."""
+    m0: float        # wet mass [kg]
+    mp: float        # propellant mass [kg]
+    CD: float        # drag coefficient
+    A: float         # frontal area [m^2]
+    tb: float        # burn time [s]
+    t_ramp: float    # thrust ramp time [s]
+    Tmax: float      # plateau thrust [N]
+    burning: bool = True   # set False for the coast phase (thrust = 0)
+
+
+def thrust(t, P):
+    """Piecewise thrust: linear ramp, constant plateau, zero after burnout."""
+    if not P.burning:
+        return 0.0
+    t = min(t, P.tb)                 # k4 of the last burn step lands exactly on tb
+    if t < P.t_ramp:
+        return P.Tmax * t / P.t_ramp
+    return P.Tmax
+
+
+def rhs(t, y, P):
+    """dy/dt for y = [h, v, J, dv_drag, dv_thrust]."""
+    h, v = y[iH], y[iV]
+    t_burned = min(max(t, 0.0), P.tb)
+    mass = P.m0 - P.mp * t_burned / P.tb                       # linear mass loss
+    T = thrust(t, P)
+    drag = 0.5 * rho0 * np.exp(-h / H) * P.CD * P.A * v * abs(v)
+    return np.array([v,                        # dh/dt
+                     (T - drag) / mass - g,    # dv/dt
+                     T,                        # dJ/dt
+                     drag / mass,              # drag deceleration
+                     T / mass])                # thrust acceleration
+
+
+def rk4_step(t, y, dt, P, rhs_func=rhs):
+    """One classical RK4 step from t to t + dt."""
+    k1 = rhs_func(t,        y,               P)
+    k2 = rhs_func(t + dt/2, y + dt*k1/2,     P)
+    k3 = rhs_func(t + dt/2, y + dt*k2/2,     P)
+    k4 = rhs_func(t + dt,   y + dt*k3,       P)
+    return y + dt * (k1 + 2*k2 + 2*k3 + k4) / 6
+
+
+def march(P, y, t_start, t_end, n_steps, log=None):
+    """Take n_steps equal RK4 steps from t_start to t_end, so both phase
+    endpoints are step boundaries and no step straddles a thrust kink."""
+    dt = (t_end - t_start) / n_steps
+    for i in range(n_steps):
+        y = rk4_step(t_start + i * dt, y, dt, P)
+        if log is not None:
+            log.append((t_start + (i + 1) * dt, y))
+    return y
+
+
+@dataclass
+class Flight:
+    """Results of one simulated flight."""
+    apogee: float        # max altitude [m]
+    t_apogee: float      # time of apogee [s]
+    t_lift: float        # lift-off time [s]
+    impulse: float       # J at burnout [N s]; should equal I
+    drag_loss: float     # velocity lost to drag, lift-off to apogee [m/s]
+    grav_loss: float     # velocity lost to gravity, lift-off to apogee [m/s]
+    thrust_dv: float     # velocity gained from thrust, lift-off to apogee [m/s]
+    traj_t: np.ndarray = None   # only filled if keep_traj=True
+    traj_y: np.ndarray = None
+
+
+def simulate(tb, m0=1.0, N=N_BURN, dt_coast=DT_COAST, keep_traj=False):
+    """Fly one rocket with burn time tb and return a Flight.
+
+    Phases (every RK4 step stays inside one phase):
+      1. ramp      [t_lift, t_ramp]   thrust rises linearly
+      2. plateau   [t_ramp, tb]       constant thrust
+      3. coast     tb -> apogee       thrust = 0, stops when v changes sign
+    The apogee is located by quadratic interpolation inside the final coast step.
+    """
+    if tb <= t_ramp:
+        raise ValueError("Burn time must exceed ramp time.")
+
+    Tmax = I / (tb - t_ramp / 2)
+    P = Rocket(m0=m0, mp=mp, CD=CD, A=A, tb=tb, t_ramp=t_ramp, Tmax=Tmax)
+
+    # Lift-off: first instant thrust equals weight (rocket sits on the pad until then).
+    t_lift = m0 * g / (Tmax / t_ramp + mp * g / tb)
+    if t_lift >= t_ramp:
+        raise ValueError("Thrust too low for liftoff during ramp.")
+
+    # Impulse already delivered while on the pad: integral of Tmax*t/t_ramp from 0 to t_lift.
+    y = np.array([0.0, 0.0, 0.5 * Tmax * t_lift**2 / t_ramp, 0.0, 0.0])
+    log = [(t_lift, y)] if keep_traj else None
+
+    y = march(P, y, t_lift, t_ramp, max(N // 10, 5), log)    # 1. ramp
+    y = march(P, y, t_ramp, tb,     N,               log)    # 2. plateau
+    impulse_at_burnout = y[iJ]
+
+    P.burning = False                                         # 3. coast
+    t = tb
+    for _ in range(2_000_000):
+        y_next = rk4_step(t, y, dt_coast, P)
+        if log is not None:
+            log.append((t + dt_coast, y_next))
+        if y_next[iV] <= 0.0:
+            # v crossed zero inside this step: interpolate to the apogee.
+            frac  = y[iV] / (y[iV] - y_next[iV])             # fraction of the step
+            s     = frac * dt_coast
+            accel = (y_next[iV] - y[iV]) / dt_coast
+            apogee = y[iH] + y[iV] * s + 0.5 * accel * s**2
+            blend = lambda k: y[k] + frac * (y_next[k] - y[k])   # linear blend of integrals
+            return Flight(
+                apogee=apogee, t_apogee=t + s, t_lift=t_lift,
+                impulse=impulse_at_burnout,
+                drag_loss=blend(iDRAG),
+                grav_loss=g * (t + s - t_lift),
+                thrust_dv=blend(iTHRUST),
+                traj_t=np.array([p[0] for p in log]) if keep_traj else None,
+                traj_y=np.array([p[1] for p in log]) if keep_traj else None)
+        y = y_next
+        t += dt_coast
+
+    raise RuntimeError("Apogee not reached.")
+## 3. Burn-time sweep
+
+For each wet mass, fly all 50 burn times and record the apogee. `t_b*` is the sweep value with the highest apogee, so it is only resolved to the grid spacing (successive burn times differ by about 7.4%).
+sweeps  = {}   # m0 -> list of Flight, one per burn time
+optimal = {}   # m0 -> t_b* [s]
+
+plt.figure(figsize=(9, 5))
+for m0 in m_values:
+    sweeps[m0] = [simulate(tb, m0=m0) for tb in burn_times]
+    apogees = np.array([f.apogee for f in sweeps[m0]])
+    best = np.argmax(apogees)
+    optimal[m0] = burn_times[best]
+    print(f"Mass: {m0:.1f} kg | Best tb: {burn_times[best]:.3f} s | Max Apogee: {apogees[best]:.2f} m")
+
+    line, = plt.plot(burn_times, apogees, label=f"m = {m0} kg")
+    plt.plot(burn_times[best], apogees[best], "o", color=line.get_color())
+
+plt.xscale("log")
+plt.xlabel("Burn Time [s]")
+plt.ylabel("Apogee [m]")
+plt.title("Rocket Apogee vs Burn Time Across Masses")
+plt.grid(True, which="both", alpha=0.3)
+plt.legend()
+plt.tight_layout()
+plt.savefig("fig_apogee_vs_burn_time.png", dpi=200)
+plt.show()
+
+# Numbers quoted in the report for the 1.0 kg rocket at the ends of the sweep
+f_short, f_long = sweeps[1.0][0], sweeps[1.0][-1]
+print(f"\n1.0 kg: tb = {burn_times[0]:.1f} s -> {f_short.apogee:.2f} m,  "
+      f"tb = {burn_times[-1]:.1f} s -> {f_long.apogee:.2f} m")
+## 4. Loss breakdown (drag vs gravity), 1.0 kg rocket
+
+Both losses are velocity losses (m/s), measured from lift-off to apogee:
+
+* **Drag loss** = ∫ D/m dt, integrated alongside the trajectory.
+* **Gravity loss** = g · (t_apogee − t_lift). This includes the coast phase.
+
+Because `v = 0` at both lift-off and apogee, the velocity budget must close exactly:
+
+$$\int \frac{T}{m}\,dt \;=\; \underbrace{\int \frac{D}{m}\,dt}_{\text{drag loss}} \;+\; \underbrace{g\,(t_{apogee}-t_{lift})}_{\text{gravity loss}}$$
+
+The left side is almost the same for every `t_b` since `I` and `m_p` are fixed (about `(I/m_p) ln(m0/(m0−m_p))`). So the **sum** of the two losses is nearly constant, and `t_b` only decides how that budget is split between them. The check below confirms the bookkeeping closes.
+flights = sweeps[1.0]
+drag = np.array([f.drag_loss for f in flights])
+grav = np.array([f.grav_loss for f in flights])
+apo  = np.array([f.apogee    for f in flights])
+dv_thrust = np.array([f.thrust_dv for f in flights])
+
+# Closure check: thrust dv = drag loss + gravity loss
+print(f"Max |thrust_dv - (drag + gravity)| over sweep: {np.max(np.abs(dv_thrust - drag - grav)):.2e} m/s")
+print(f"Drag + gravity ranges from {np.min(drag + grav):.1f} to {np.max(drag + grav):.1f} m/s")
+
+fig, ax1 = plt.subplots(figsize=(9, 5))
+ax1.plot(burn_times, drag, label="Drag loss")
+ax1.plot(burn_times, grav, label="Gravity loss")
+ax1.plot(burn_times, drag + grav, "k--", label="Sum")
+ax1.set_xscale("log")
+ax1.set_xlabel("Burn time [s]")
+ax1.set_ylabel("Velocity loss [m/s]")
+
+ax2 = ax1.twinx()
+ax2.plot(burn_times, apo, "r", label="Apogee")
+ax2.axvline(burn_times[np.argmax(apo)], color="r", ls=":")
+ax2.set_ylabel("Apogee [m]")
+
+h1, l1 = ax1.get_legend_handles_labels()
+h2, l2 = ax2.get_legend_handles_labels()
+ax1.legend(h1 + h2, l1 + l2, loc="center right")
+plt.title("Drag vs. gravity loss, m0 = 1.0 kg")
+plt.tight_layout()
+plt.savefig("fig_loss_breakdown.png", dpi=200)
+plt.show()
+## 5. Verification and parameter selection
+
+### 5a. Self-convergence (apogee error vs a fine reference)
+
+Each mass is flown at its own `t_b*` with the burn-phase step count `N` doubled from 200 to 3200 (coast step halved alongside). The reference is the same flight at 64× the baseline resolution. Expect an observed order near 4 until the error hits the double-precision floor (about 1e-12 m for a 660 m apogee). Orders computed below that floor are noise.
+refinements = np.array([1, 2, 4, 8, 16])
+R_REF = 64                                   # reference run uses 64x the baseline resolution
+
+
+def convergence_study(m0, tb):
+    """Apogees at N = 200*r for each r, plus the fine reference apogee."""
+    h_ref = simulate(tb, m0=m0, N=N_BURN * R_REF, dt_coast=DT_COAST / R_REF).apogee
+    Ns    = N_BURN * refinements
+    dts   = (tb - t_ramp) / Ns               # burn-phase step size
+    apogees = np.array([simulate(tb, m0=m0, N=N, dt_coast=DT_COAST / r).apogee
+                        for N, r in zip(Ns, refinements)])
+    return dict(h_ref=h_ref, Ns=Ns, dts=dts, apogees=apogees,
+                errors=np.abs(apogees - h_ref))
+
+
+conv = {}
+for m0 in m_values:
+    tb = optimal[m0]
+    c = conv[m0] = convergence_study(m0, tb)
+    print(f"\nMass = {m0:.1f} kg | Optimal tb = {tb:.3f} s | h_ref = {c['h_ref']:.8f} m")
+    print(f"{'N steps':<10} {'dt [s]':<12} {'Apogee [m]':<15} {'Error [m]':<12} {'Order':<8}")
+    print("-" * 57)
+    for j, (N, dt, h, err) in enumerate(zip(c["Ns"], c["dts"], c["apogees"], c["errors"])):
+        order = "—" if j == 0 else f"{np.log2(c['errors'][j-1] / err):.2f}"
+        print(f"{N:<10d} {dt:<12.6f} {h:<15.8f} {err:<12.3e} {order:<8}")
+
+# --- Figure: error vs dt, with a dt^4 reference line anchored to the 1.0 kg case
+plt.figure(figsize=(9, 5))
+for m0 in m_values:
+    plt.loglog(conv[m0]["dts"], conv[m0]["errors"], "o-", label=f"m = {m0} kg")
+d, e = conv[1.0]["dts"], conv[1.0]["errors"]
+plt.loglog(d, e[0] * (d / d[0])**4, "k--", label=r"4th-order ($\Delta t^4$)")
+plt.xlabel(r"Burn-phase Step Size $\Delta t$ [s]")
+plt.ylabel("Apogee Error [m]")
+plt.title("RK4 Convergence Study Across All Mass Configurations")
+plt.grid(True, which="both", alpha=0.3)
+plt.legend()
+plt.tight_layout()
+plt.savefig("fig_convergence_error.png", dpi=200)
+plt.show()
+
+# --- Figure: change in apogee between successive refinements (no reference needed)
+plt.figure(figsize=(8, 5))
+for m0 in m_values:
+    changes = np.abs(np.diff(conv[m0]["apogees"]))
+    plt.loglog(conv[m0]["Ns"][:-1], changes, "o-", label=f"m = {m0} kg")
+plt.xlabel("Burn-phase RK4 steps, N")
+plt.ylabel("Change from next refinement [m]")
+plt.title("Successive Apogee Changes Across All Masses")
+plt.grid(True, which="both", alpha=0.3)
+plt.legend(fontsize=9)
+plt.tight_layout()
+plt.savefig("fig_successive_changes.png", dpi=200)
+plt.show()
+
+print("\nApogee change from N=200 to N=400 (m):",
+      {m0: f"{abs(conv[m0]['apogees'][1] - conv[m0]['apogees'][0]):.2e}" for m0 in m_values})
+### 5b. Exact solution check (drag-free rocket equation)
+
+A mistake in the equations would still converge cleanly in 5a, so we also compare against the closed-form solution with drag off, constant thrust `T = v_e * mdot`, and linear mass loss `m = m0 - mdot t`:
+
+$$v = v_e\ln\frac{m_0}{m} - g t,\qquad h = \frac{v_e}{\dot m}\left(m_0 - m - m\ln\frac{m_0}{m}\right) - \tfrac12 g t^2 .$$
+
+We run this twice. The first uses a stand-alone 2-state right-hand side (this isolates `rk4_step`). The second uses the **production** `rhs` with `CD = 0` and no ramp, so it also tests the thrust, mass, and bookkeeping code that the real simulations rely on.
+m0_t, mdot_t, ve_t, T_final = 1.0, 0.02, 1200.0, 5.0
+step_counts = [10, 20, 40, 80]
+
+
+def rocket_equation_exact(t):
+    """Exact (h, v) for constant thrust, no drag, uniform gravity."""
+    m = m0_t - mdot_t * t
+    v = ve_t * np.log(m0_t / m) - g * t
+    h = (ve_t / mdot_t) * (m0_t - m - m * np.log(m0_t / m)) - 0.5 * g * t**2
+    return h, v
+
+
+def standalone_rhs(t, y, P):
+    """2-state drag-free model, written independently of the production rhs."""
+    mass = m0_t - mdot_t * t
+    return np.array([y[1], ve_t * mdot_t / mass - g])
+
+
+# Production rhs with drag switched off (CD = 0) and thrust constant from t = 0 (t_ramp = 0)
+P_prod = Rocket(m0=m0_t, mp=mdot_t * T_final, CD=0.0, A=A,
+                tb=T_final, t_ramp=0.0, Tmax=ve_t * mdot_t)
+h_ex, v_ex = rocket_equation_exact(T_final)
+
+dt_vals, err_standalone, err_production = [], [], []
+for N in step_counts:
+    dt = T_final / N
+    y_a = np.zeros(2)
+    y_b = np.zeros(5)
+    for i in range(N):
+        y_a = rk4_step(i * dt, y_a, dt, None, rhs_func=standalone_rhs)
+        y_b = rk4_step(i * dt, y_b, dt, P_prod)
+    dt_vals.append(dt)
+    err_standalone.append(np.hypot(y_a[0] - h_ex, y_a[1] - v_ex))
+    err_production.append(np.hypot(y_b[iH] - h_ex, y_b[iV] - v_ex))
+
+dt_vals = np.array(dt_vals)
+print(f"{'dt [s]':<10} {'standalone err':<16} {'production err':<16} {'order (standalone)':<20}")
+for j, dt in enumerate(dt_vals):
+    order = "—" if j == 0 else f"{np.log2(err_standalone[j-1] / err_standalone[j]):.3f}"
+    print(f"{dt:<10.4f} {err_standalone[j]:<16.3e} {err_production[j]:<16.3e} {order:<20}")
+print(f"\nImpulse state vs Tmax*t (production rhs): {abs(y_b[iJ] - P_prod.Tmax * T_final):.2e} N s")
+
+plt.figure(figsize=(8, 4))
+plt.loglog(dt_vals, err_standalone, "o-", label="Stand-alone rhs")
+plt.loglog(dt_vals, err_production, "s--", label="Production rhs (CD = 0)")
+plt.loglog(dt_vals, err_standalone[0] * (dt_vals / dt_vals[0])**4, ":", color="k", label=r"$\Delta t^4$ reference")
+plt.xlabel("Time Step [s]")
+plt.ylabel("Error vs exact rocket equation")
+plt.title("Exact-solution Verification")
+plt.grid(True, which="both", alpha=0.3)
+plt.legend()
+plt.tight_layout()
+plt.savefig("fig_exact_solution_check.png", dpi=200)
+plt.show()
+### 5c. Impulse conservation
+
+The report states that total impulse is `I = 200 N s` for every burn time. This checks `J(t_b)` for every flight in the sweep.
+worst = max(abs(f.impulse - I) for m0 in m_values for f in sweeps[m0])
+print(f"Max |J(t_b) - I| over all {len(m_values) * len(burn_times)} flights: {worst:.2e} N s")
+### 5d. Stability check
+
+RK4 is stable on `y' = λy` when `|λ|Δt < 2.785` (negative real `λ`). For this system `λ` comes from the Jacobian of `[v, a]` with respect to `[h, v]`:
+
+$$\mathbf J = \begin{bmatrix}0 & 1\\ \dfrac{D}{mH} & -\dfrac{\rho\, C_D A\,|v|}{m}\end{bmatrix}.$$
+
+For each flight we evaluate the eigenvalues along the whole trajectory and multiply the largest `|λ|` by the **largest** step used (conservative).
+def stability_number(tb, m0):
+    """Return (max |lambda| along the trajectory [1/s], max |lambda| * dt_max)."""
+    f = simulate(tb, m0=m0, keep_traj=True)
+    t, h, v = f.traj_t, f.traj_y[:, iH], f.traj_y[:, iV]
+    mass = m0 - mp * np.minimum(t, tb) / tb
+    rho  = rho0 * np.exp(-h / H)
+    a_v  = -rho * CD * A * np.abs(v) / mass                  # d(accel)/dv
+    a_h  = 0.5 * rho * CD * A * v * np.abs(v) / (H * mass)   # d(accel)/dh  = D/(m H)
+    disc = np.sqrt((a_v**2 + 4 * a_h).astype(complex))       # eigenvalues of [[0,1],[a_h,a_v]]
+    lam  = np.maximum(np.abs((a_v + disc) / 2), np.abs((a_v - disc) / 2))
+    dt_max = max((tb - t_ramp) / N_BURN, DT_COAST)
+    return lam.max(), lam.max() * dt_max
+
+
+results = [(m0, tb, *stability_number(tb, m0)) for m0 in m_values for tb in burn_times[::7]]
+m_w, tb_w, lam_w, sn_w = max(results, key=lambda r: r[3])
+print(f"Worst case over {len(results)} flights: m0 = {m_w} kg, tb = {tb_w:.2f} s")
+print(f"  max |lambda| = {lam_w:.3f} 1/s,  |lambda|*dt = {sn_w:.4f}  (limit 2.785)")
+## 6. How the optimum burn time depends on the rocket
+
+Only the mass is varied here. `C_D` and `A` are held fixed at the values in Section 1. The ballistic coefficient `β = m0 / (C_D A)` is the natural measure of drag relative to inertia. `t_b*` is only resolved to the sweep grid, so treat the points as ±4%.
+beta = np.array([m0 / (CD * A) for m0 in m_values])       # kg/m^2
+tb_star = np.array([optimal[m0] for m0 in m_values])
+
+fig, ax = plt.subplots(figsize=(7, 4.5))
+ax.plot(beta, tb_star, "o-")
+for m0, b, t_opt in zip(m_values, beta, tb_star):
+    ax.annotate(f"{m0} kg", (b, t_opt), textcoords="offset points", xytext=(6, 4), fontsize=9)
+ax.set_xlabel(r"Ballistic coefficient $\beta = m_0/(C_D A)$ [kg/m$^2$]")
+ax.set_ylabel(r"Optimal burn time $t_b^*$ [s]")
+ax.set_title("Apogee-maximizing burn time vs rocket mass")
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig("fig_tb_opt_vs_mass.png", dpi=200)
+plt.show()
